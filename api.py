@@ -29,10 +29,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+import logging
+
 load_dotenv()
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -43,6 +46,7 @@ async def lifespan(app: FastAPI):
     gemini_key = os.environ.get("GEMINI_API_KEY")
     if gemini_key:
         from google import genai
+
         app.state.gemini = genai.Client(api_key=gemini_key)
     else:
         app.state.gemini = None
@@ -61,6 +65,7 @@ app.add_middleware(
 
 
 # ── Models ─────────────────────────────────────────────────────────────────────
+
 
 class DrugResult(BaseModel):
     found: bool
@@ -88,10 +93,18 @@ class ImageVerifyResult(BaseModel):
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 DRUG_FIELDS = [
-    "id", "moph_code", "trade_name", "scientific_name",
-    "dosage_form", "strength", "manufacturer",
-    "country_origin", "registration_status", "price_usd",
+    "id",
+    "moph_code",
+    "trade_name",
+    "scientific_name",
+    "dosage_form",
+    "strength",
+    "manufacturer",
+    "country_origin",
+    "registration_status",
+    "price_usd",
 ]
+
 
 def row_to_drug_result(row: dict, verdict: str, detail: str) -> DrugResult:
     return DrugResult(
@@ -100,6 +113,7 @@ def row_to_drug_result(row: dict, verdict: str, detail: str) -> DrugResult:
         verdict_detail=detail,
         **{k: row.get(k) for k in DRUG_FIELDS},
     )
+
 
 def status_to_verdict(drug: dict) -> tuple[str, str]:
     name = drug.get("trade_name", "")
@@ -123,6 +137,7 @@ def status_to_verdict(drug: dict) -> tuple[str, str]:
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
+
 @app.get("/health")
 async def health():
     return {
@@ -135,8 +150,7 @@ async def health():
 @app.get("/drugs/barcode/{barcode}", response_model=DrugResult)
 async def lookup_barcode(barcode: str):
     res = (
-        app.state.db
-        .table("drug_barcodes")
+        app.state.db.table("drug_barcodes")
         .select("*, drugs(*)")
         .eq("barcode", barcode.strip())
         .limit(1)
@@ -166,8 +180,7 @@ async def search_drugs(
     limit: int = Query(10, ge=1, le=50),
 ):
     res = (
-        app.state.db
-        .table("drugs")
+        app.state.db.table("drugs")
         .select("*")
         .ilike("trade_name", f"%{q}%")
         .limit(limit)
@@ -176,15 +189,14 @@ async def search_drugs(
     rows = res.data or []
 
     res2 = (
-        app.state.db
-        .table("drugs")
+        app.state.db.table("drugs")
         .select("*")
         .ilike("scientific_name", f"%{q}%")
         .limit(limit)
         .execute()
     )
     seen = {r["moph_code"] for r in rows}
-    for r in (res2.data or []):
+    for r in res2.data or []:
         if r["moph_code"] not in seen:
             rows.append(r)
             seen.add(r["moph_code"])
@@ -220,8 +232,7 @@ async def verify_image(
         raise HTTPException(400, "Image too large. Max 10MB.")
 
     res = (
-        app.state.db
-        .table("drugs")
+        app.state.db.table("drugs")
         .select("*")
         .ilike("trade_name", drug_name)
         .limit(1)
@@ -274,6 +285,7 @@ Rules:
 
     try:
         from google.genai import types
+
         response = app.state.gemini.models.generate_content(
             model="gemini-1.5-flash",
             contents=[
@@ -286,6 +298,7 @@ Rules:
         )
 
         raw = response.text.strip().replace("```json", "").replace("```", "").strip()
+        logging.info(f"Gemini raw: {raw[:300]}")
         result = json.loads(raw)
 
         verdict = result.get("verdict", "unknown")
@@ -315,16 +328,18 @@ Rules:
             explanation="Please consult a pharmacist to verify this medication.",
         )
 
-    except Exception:
+    except Exception as e:
+        logging.error(f"Gemini error: {str(e)}")
         return ImageVerifyResult(
             verdict="unknown",
             confidence=0.0,
-            flags=[],
+            flags=[str(e)],
             explanation="Image analysis temporarily unavailable. Please consult a pharmacist.",
         )
 
 
 # ── Crowdsource: link a barcode to a drug ─────────────────────────────────────
+
 
 class LinkBarcodeRequest(BaseModel):
     barcode: str
@@ -346,8 +361,7 @@ async def link_barcode(body: LinkBarcodeRequest):
     """
     # Check drug exists
     drug_res = (
-        app.state.db
-        .table("drugs")
+        app.state.db.table("drugs")
         .select("id, trade_name")
         .eq("id", body.drug_id)
         .limit(1)
@@ -358,8 +372,7 @@ async def link_barcode(body: LinkBarcodeRequest):
 
     # Check barcode not already linked
     existing = (
-        app.state.db
-        .table("drug_barcodes")
+        app.state.db.table("drug_barcodes")
         .select("id")
         .eq("barcode", body.barcode.strip())
         .limit(1)
@@ -368,19 +381,21 @@ async def link_barcode(body: LinkBarcodeRequest):
     if existing.data:
         return LinkBarcodeResult(
             success=False,
-            message="This barcode is already linked to a drug in our database."
+            message="This barcode is already linked to a drug in our database.",
         )
 
     # Insert unverified link
-    app.state.db.table("drug_barcodes").insert({
-        "drug_id":      body.drug_id,
-        "barcode":      body.barcode.strip(),
-        "barcode_type": body.barcode_type,
-        "verified":     False,   # admin must verify before it's trusted
-    }).execute()
+    app.state.db.table("drug_barcodes").insert(
+        {
+            "drug_id": body.drug_id,
+            "barcode": body.barcode.strip(),
+            "barcode_type": body.barcode_type,
+            "verified": False,  # admin must verify before it's trusted
+        }
+    ).execute()
 
     drug_name = drug_res.data[0]["trade_name"]
     return LinkBarcodeResult(
         success=True,
-        message=f"Thank you! Barcode linked to {drug_name}. Our team will verify it shortly."
+        message=f"Thank you! Barcode linked to {drug_name}. Our team will verify it shortly.",
     )
