@@ -287,7 +287,7 @@ Rules:
         from google.genai import types
 
         response = app.state.gemini.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.0-flash",
             contents=[
                 prompt,
                 types.Part.from_bytes(
