@@ -288,7 +288,8 @@ Rules:
 
         response = app.state.gemini.models.generate_content(
             # model="gemini-2.0-flash",
-            model="gemini-1.5-flash-latest",
+            # model="gemini-1.5-flash-latest",
+            model="gemini-2.0-flash-lite",
             contents=[
                 prompt,
                 types.Part.from_bytes(
