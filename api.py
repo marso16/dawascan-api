@@ -5,7 +5,6 @@ Endpoints:
   GET  /health
   GET  /drugs/barcode/{barcode}   — lookup by scanned barcode
   GET  /drugs/search?q=augmentin  — fuzzy name search
-  POST /drugs/verify-image        — AI packaging check (free Gemini)
 
 Run:
   uvicorn api:app --reload --port 8000
@@ -13,10 +12,6 @@ Run:
 .env file:
   NEXT_PUBLIC_SUPABASE_URL=https://xxxx.supabase.co
   NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_...
-  GEMINI_API_KEY=AIza...   (optional — free at aistudio.google.com/app/apikey)
-
-Install:
-  pip install fastapi uvicorn supabase google-genai python-dotenv
 """
 
 import os
@@ -42,15 +37,6 @@ async def lifespan(app: FastAPI):
     url = os.environ["NEXT_PUBLIC_SUPABASE_URL"]
     key = os.environ["NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY"]
     app.state.db: Client = create_client(url, key)
-
-    gemini_key = os.environ.get("GEMINI_API_KEY")
-    if gemini_key:
-        from google import genai
-
-        app.state.gemini = genai.Client(api_key=gemini_key)
-    else:
-        app.state.gemini = None
-
     yield
 
 
@@ -81,13 +67,6 @@ class DrugResult(BaseModel):
     price_usd: float | None = None
     verdict: str | None = None
     verdict_detail: str | None = None
-
-
-class ImageVerifyResult(BaseModel):
-    verdict: str
-    confidence: float
-    flags: list[str]
-    explanation: str
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -143,7 +122,6 @@ async def health():
     return {
         "status": "ok",
         "version": "0.3.0",
-        "image_verify": "available" if app.state.gemini else "no GEMINI_API_KEY set",
     }
 
 
@@ -210,138 +188,7 @@ async def search_drugs(
         results.append(row_to_drug_result(r, verdict, detail))
     return results
 
-
-@app.post("/drugs/verify-image", response_model=ImageVerifyResult)
-async def verify_image(
-    drug_name: str = Query(..., description="Name of the drug shown in the photo"),
-    image: UploadFile = File(...),
-):
-    if not app.state.gemini:
-        raise HTTPException(
-            503,
-            detail=(
-                "Image verification unavailable — GEMINI_API_KEY not set. "
-                "Get a free key at https://aistudio.google.com/app/apikey"
-            ),
-        )
-
-    img_bytes = await image.read()
-    if not img_bytes:
-        raise HTTPException(400, "Image file is empty.")
-    if len(img_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(400, "Image too large. Max 10MB.")
-
-    res = (
-        app.state.db.table("drugs")
-        .select("*")
-        .ilike("trade_name", drug_name)
-        .limit(1)
-        .execute()
-    )
-    drug = res.data[0] if res.data else None
-
-    drug_context = ""
-    if drug:
-        drug_context = f"""
-Known MoPH registration:
-- Code: {drug['moph_code']}
-- Manufacturer: {drug['manufacturer']} ({drug['country_origin']})
-- Form: {drug['dosage_form']}, Strength: {drug['strength']}
-- Status: {drug['registration_status']}
-"""
-
-    prompt = f"""You are a pharmaceutical packaging expert helping detect suspicious medications in Lebanon.
-
-The user photographed a drug package they believe is: {drug_name}
-{drug_context}
-Examine the image for these issues:
-1. Font problems — wrong size, weight, typos, mixed fonts
-2. Logo quality — blurry, pixelated, stretched, misaligned
-3. Color accuracy — off-brand colors
-4. Security features — missing or suspicious hologram/seal
-5. Batch/expiry format — wrong format for this manufacturer
-6. Print quality — bleeding ink, misalignment, fading
-7. Text errors — spelling or grammar mistakes in any language
-8. Barcode — damaged, photocopied, or low quality
-
-Respond ONLY in this exact JSON, no other text:
-{{
-  "verdict": "likely_authentic",
-  "confidence": 0.85,
-  "flags": [],
-  "explanation": "The packaging appears consistent with genuine product."
-}}
-
-verdict must be exactly: "likely_authentic", "suspicious", or "unknown"
-confidence is 0.0 to 1.0
-flags is a list of strings (empty list if no issues)
-explanation is one plain sentence a non-expert can understand
-
-Rules:
-- Never use "fake" or "counterfeit" — only "suspicious"
-- Image too blurry/dark/partial to assess → "unknown"
-- If unsure, lower confidence rather than flagging suspicious
-- For suspicious results, mention consulting a pharmacist"""
-
-    try:
-        from google.genai import types
-
-        response = app.state.gemini.models.generate_content(
-            # model="gemini-2.0-flash",
-            # model="gemini-1.5-flash-latest",
-            model="gemini-2.0-flash-lite",
-            contents=[
-                prompt,
-                types.Part.from_bytes(
-                    data=img_bytes,
-                    mime_type=image.content_type or "image/jpeg",
-                ),
-            ],
-        )
-
-        raw = response.text.strip().replace("```json", "").replace("```", "").strip()
-        logging.info(f"Gemini raw: {raw[:300]}")
-        result = json.loads(raw)
-
-        verdict = result.get("verdict", "unknown")
-        if verdict not in ("likely_authentic", "suspicious", "unknown"):
-            verdict = "unknown"
-
-        return ImageVerifyResult(
-            verdict=verdict,
-            confidence=max(0.0, min(1.0, float(result.get("confidence", 0.5)))),
-            flags=result.get("flags", []),
-            explanation=result.get(
-                "explanation", "Unable to assess. Please consult a pharmacist."
-            ),
-        )
-
-    except json.JSONDecodeError:
-        text = response.text.lower() if hasattr(response, "text") else ""
-        verdict = (
-            "suspicious"
-            if any(w in text for w in ("suspicious", "fake", "counterfeit", "problem"))
-            else "unknown"
-        )
-        return ImageVerifyResult(
-            verdict=verdict,
-            confidence=0.3,
-            flags=["Analysis returned unexpected format"],
-            explanation="Please consult a pharmacist to verify this medication.",
-        )
-
-    except Exception as e:
-        logging.error(f"Gemini error: {str(e)}")
-        return ImageVerifyResult(
-            verdict="unknown",
-            confidence=0.0,
-            flags=[str(e)],
-            explanation="Image analysis temporarily unavailable. Please consult a pharmacist.",
-        )
-
-
 # ── Crowdsource: link a barcode to a drug ─────────────────────────────────────
-
 
 class LinkBarcodeRequest(BaseModel):
     barcode: str

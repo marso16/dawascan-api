@@ -1,6 +1,5 @@
 fastapi
 uvicorn
 supabase
-google-genai
 python-dotenv
 python-multipart
